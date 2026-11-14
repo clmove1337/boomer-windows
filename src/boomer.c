@@ -1,6 +1,6 @@
 // boomer for Windows: zoom into a screenshot of the desktop, pixelated.
-// Drag = pan, Alt+drag = draw, wheel = zoom, F = flashlight, Ctrl+wheel = flashlight size,
-// 0 = reset, Q/Esc = quit.
+// Drag = pan, Alt+drag = draw, Ctrl+Z = undo last line, wheel = zoom, F = flashlight,
+// Ctrl+wheel = flashlight size, 0 = reset, Q/Esc = quit.
 // `boomer --daemon` stays in the background and pops up instantly on Win+Shift+Z.
 #define WIN32_LEAN_AND_MEAN
 #define COBJMACROS
@@ -9,12 +9,14 @@
 #include <dxgi1_2.h>
 #include <dwmapi.h>
 #include <math.h>
+#include <stdlib.h>
 #include <string.h>
 #include <shellapi.h>
 #include <limits.h>
 
 static int sw, sh, sx, sy;           // virtual screen size/origin
 static HDC hdcImg, hdcDim, hdcBack;  // screenshot, darkened screenshot, back buffer
+static HDC hdcOrig;                  // unmarked screenshot, saved on the first stroke for undo
 static DWORD *img, *dim;
 static int daemon;
 static int dim_brightness = -1;     // integer multiplier used for the cached pixels
@@ -26,6 +28,14 @@ static int drawing;                 // gesture mode selected on button-down
 static int repaint_pending;         // coalesce input updates until the next display frame
 static double shade;                 // flashlight darkness, animated 0..1 towards `flashlight`
 static double radius = 200;
+
+// Undo history: every painted segment in image coordinates, grouped into strokes.
+typedef struct { int x0, y0, x1, y1, width; } Seg;
+static Seg *segs;
+static int nsegs, segcap;
+static int *strokes;                 // index of each stroke's first segment
+static int nstrokes, strokecap;
+static int new_stroke;               // the next recorded segment starts a stroke
 
 // One Desktop Duplication per monitor; works for fullscreen games where GDI sees black.
 typedef struct {
@@ -96,11 +106,15 @@ static void free_dib(HDC dc) {
 }
 
 static void free_bufs(void) {
-    free_dib(hdcImg); free_dib(hdcDim); free_dib(hdcBack);
-    hdcImg = hdcDim = hdcBack = NULL;
+    free_dib(hdcImg); free_dib(hdcDim); free_dib(hdcBack); free_dib(hdcOrig);
+    hdcImg = hdcDim = hdcBack = hdcOrig = NULL;
     img = dim = NULL;
     sw = sh = 0;
     repaint_pending = 0;
+    // Marks belong to one screenshot.
+    free(segs); free(strokes);
+    segs = NULL; strokes = NULL;
+    nsegs = segcap = nstrokes = strokecap = new_stroke = 0;
 }
 
 // Follow the current monitor layout: allocate buffers and size the window to it.
@@ -273,32 +287,96 @@ static DWORD darken(DWORD pixel, DWORD brightness) {
            ((pixel & 0x00ff00) * brightness >> 8 & 0x00ff00);
 }
 
+#define INK RGB(255, 64, 64)
+
+// Paint segments [from, to) into the screenshot, reusing the pen while the width stays the same.
+static void paint_segs(int from, int to) {
+    HPEN pen = NULL;
+    HGDIOBJ old = NULL;
+    int width = 0;
+    for (int i = from; i < to; i++) {
+        Seg *s = &segs[i];
+        if (!pen || s->width != width) {
+            HPEN p = CreatePen(PS_SOLID, s->width, INK);
+            if (!p) continue;
+            HGDIOBJ prev = SelectObject(hdcImg, p);
+            if (!prev || prev == HGDI_ERROR) { DeleteObject(p); continue; }
+            if (pen) DeleteObject(pen); // prev was our previous pen
+            else old = prev;
+            pen = p;
+            width = s->width;
+        }
+        MoveToEx(hdcImg, s->x0, s->y0, NULL);
+        LineTo(hdcImg, s->x1, s->y1);
+        // LineTo excludes its final pixel; also make a click without movement visible.
+        SetPixelV(hdcImg, s->x1, s->y1, INK);
+    }
+    if (pen) {
+        SelectObject(hdcImg, old);
+        DeleteObject(pen);
+        dim_brightness = -1;
+    }
+}
+
+static int grow(void **p, int *cap, size_t size, int need) {
+    void *q;
+    int n;
+    if (need <= *cap) return 1;
+    if (*cap > INT_MAX / 2) return 0;
+    n = max(*cap * 2, 256);
+    q = realloc(*p, (size_t)n * size);
+    if (!q) return 0;
+    *p = q;
+    *cap = n;
+    return 1;
+}
+
+// Start an undoable stroke. The first one saves the unmarked screenshot to restore from.
+static int begin_stroke(void) {
+    if (!hdcOrig) {
+        DWORD *bits;
+        hdcOrig = make_dib(sw, sh, &bits);
+        if (!hdcOrig) return 0;
+        if (!BitBlt(hdcOrig, 0, 0, sw, sh, hdcImg, 0, 0, SRCCOPY)) {
+            free_dib(hdcOrig);
+            hdcOrig = NULL;
+            return 0;
+        }
+    }
+    new_stroke = 1;
+    return 1;
+}
+
+// Remove the latest stroke: restore the unmarked screenshot and replay the remaining strokes.
+static int undo_stroke(void) {
+    if (!nstrokes || !hdcOrig || !hdcImg) return 0;
+    nsegs = strokes[--nstrokes];
+    new_stroke = 0;
+    BitBlt(hdcImg, 0, 0, sw, sh, hdcOrig, 0, 0, SRCCOPY);
+    paint_segs(0, nsegs);
+    dim_brightness = -1;
+    return 1;
+}
+
 // Paint into the screenshot so marks naturally follow zoom/pan and the flashlight.
 // The pen is roughly three screen pixels wide at the zoom where it is drawn.
+// Segments are only drawn once recorded, so everything on screen can be undone.
 static void draw_line(int x0, int y0, int x1, int y1) {
     double ax = vx + x0 / scale, ay = vy + y0 / scale;
     double bx = vx + x1 / scale, by = vy + y1 / scale;
     int width = max(1, (int)lround(3 / scale));
-    if (!hdcImg || !isfinite(ax) || !isfinite(ay) || !isfinite(bx) || !isfinite(by)) return;
+    if (!hdcImg || !hdcOrig || !isfinite(ax) || !isfinite(ay) || !isfinite(bx) || !isfinite(by)) return;
     if (max(ax, bx) < -width || min(ax, bx) > sw + width ||
         max(ay, by) < -width || min(ay, by) > sh + width) return;
     // Leave room for the rounded endpoints and pen width before converting to GDI coordinates.
     if (min(ax, bx) < INT_MIN / 2 || max(ax, bx) > INT_MAX / 2 ||
         min(ay, by) < INT_MIN / 2 || max(ay, by) > INT_MAX / 2) return;
-    HPEN pen = CreatePen(PS_SOLID, width, RGB(255, 64, 64));
-    if (!pen) return;
-    HGDIOBJ old = SelectObject(hdcImg, pen);
-    if (old && old != HGDI_ERROR) {
-        int a = (int)lround(ax), b = (int)lround(ay);
-        int c = (int)lround(bx), d = (int)lround(by);
-        MoveToEx(hdcImg, a, b, NULL);
-        LineTo(hdcImg, c, d);
-        // LineTo excludes its final pixel; also make a click without movement visible.
-        SetPixelV(hdcImg, c, d, RGB(255, 64, 64));
-        SelectObject(hdcImg, old);
-        dim_brightness = -1;
-    }
-    DeleteObject(pen);
+    if (!grow((void **)&segs, &segcap, sizeof(*segs), nsegs + 1) ||
+        (new_stroke && !grow((void **)&strokes, &strokecap, sizeof(*strokes), nstrokes + 1))) return;
+    if (new_stroke) { strokes[nstrokes++] = nsegs; new_stroke = 0; }
+    Seg s = {(int)lround(ax), (int)lround(ay), (int)lround(bx), (int)lround(by), width};
+    segs[nsegs++] = s;
+    paint_segs(nsegs - 1, nsegs);
 }
 
 static HANDLE make_frame_timer(void) {
@@ -401,6 +479,11 @@ static LRESULT CALLBACK wndproc(HWND w, UINT m, WPARAM wp, LPARAM lp) {
         if (closing) return 0;
         mx = (short)LOWORD(lp); my = (short)HIWORD(lp);
         drawing = (GetKeyState(VK_MENU) & 0x8000) != 0;
+        if (drawing && !begin_stroke()) {
+            drawing = 0;
+            MessageBoxW(w, L"Not enough memory for drawing", L"boomer", MB_ICONERROR);
+            return 0;
+        }
         dragging = !drawing;
         SetCapture(w);
         if (drawing) { draw_line(mx, my, mx, my); repaint_pending = 1; }
@@ -426,6 +509,11 @@ static LRESULT CALLBACK wndproc(HWND w, UINT m, WPARAM wp, LPARAM lp) {
         return 0;
     }
     case WM_KEYDOWN:
+        // Ctrl+Z repeats while held, like undo elsewhere; not mid-stroke.
+        if (wp == 'Z' && (GetKeyState(VK_CONTROL) & 0x8000)) {
+            if (!closing && !drawing && undo_stroke()) repaint_pending = 1;
+            return 0;
+        }
         if (lp & 0x40000000) return 0; // auto-repeat of a held key
         if (wp == VK_ESCAPE || wp == 'Q') { // first press animates out, a second one skips it
             if (closing) { hide(w); return 0; }
@@ -541,19 +629,44 @@ static int self_test(void) {
     CHECK(hdcImg && img);
     memset(img, 0, (size_t)sw * sh * sizeof(*img));
     scale = 2; vx = 4; vy = 6; dim_brightness = 64;
+    CHECK(!undo_stroke()); // nothing to undo yet
+    CHECK(begin_stroke() && hdcOrig);
     draw_line(4, 4, 20, 4); // image (6,8) through (14,8)
     GdiFlush();
     CHECK((img[8 * sw + 6] & 0xffffff) == 0xff4040);
     CHECK((img[8 * sw + 10] & 0xffffff) == 0xff4040);
     CHECK((img[8 * sw + 14] & 0xffffff) == 0xff4040);
     CHECK(img[0] == 0 && dim_brightness == -1);
+    CHECK(begin_stroke());
     draw_line(8, 12, 8, 12); // click without movement: image (8,12)
     GdiFlush();
     CHECK((img[12 * sw + 8] & 0xffffff) == 0xff4040);
     vx = vy = -1e30; dim_brightness = 64;
+    CHECK(begin_stroke());
     draw_line(0, 0, 100, 100);
     CHECK(dim_brightness == 64); // off-image strokes do not touch buffers
+    CHECK(nstrokes == 2);        // ...and leave nothing to undo
+    // A wider pen at another zoom: image (20,20) through (20,28), 3 pixels wide.
+    scale = 1; vx = vy = 0;
+    CHECK(begin_stroke());
+    draw_line(20, 20, 20, 28);
+    GdiFlush();
+    CHECK((img[24 * sw + 19] & 0xffffff) == 0xff4040 && (img[24 * sw + 21] & 0xffffff) == 0xff4040);
+    // Undo removes the latest stroke only, then each earlier one, back to the clean screenshot.
+    dim_brightness = 64;
+    CHECK(undo_stroke() && nstrokes == 2 && dim_brightness == -1);
+    GdiFlush();
+    CHECK(img[24 * sw + 19] == 0 && img[24 * sw + 20] == 0 && img[24 * sw + 21] == 0);
+    CHECK((img[12 * sw + 8] & 0xffffff) == 0xff4040 && (img[8 * sw + 10] & 0xffffff) == 0xff4040);
+    CHECK(undo_stroke());
+    GdiFlush();
+    CHECK(img[12 * sw + 8] == 0 && (img[8 * sw + 10] & 0xffffff) == 0xff4040);
+    CHECK(undo_stroke() && nstrokes == 0 && nsegs == 0);
+    GdiFlush();
+    for (int i = 0; i < sw * sh; i++) CHECK(img[i] == 0);
+    CHECK(!undo_stroke());
     free_bufs();
+    CHECK(!hdcOrig && !segs && !strokes && !nstrokes && !nsegs);
     // Exercise both lazy allocation paths and repeated/partial cleanup.
     DWORD before = GetGuiResources(GetCurrentProcess(), GR_GDIOBJECTS);
     for (int pass = 0; pass < 100; pass++) {
