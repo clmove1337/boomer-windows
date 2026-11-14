@@ -1,5 +1,5 @@
 // boomer for Windows: zoom into a screenshot of the desktop, pixelated.
-// Drag = pan, wheel = zoom, F = flashlight, Ctrl+wheel = flashlight size,
+// Drag = pan, Alt+drag = draw, wheel = zoom, F = flashlight, Ctrl+wheel = flashlight size,
 // 0 = reset, Q/Esc = quit.
 // `boomer --daemon` stays in the background and pops up instantly on Win+Shift+Z.
 #define WIN32_LEAN_AND_MEAN
@@ -10,17 +10,20 @@
 #include <dwmapi.h>
 #include <math.h>
 #include <string.h>
-#include <assert.h>
+#include <shellapi.h>
+#include <limits.h>
 
 static int sw, sh, sx, sy;           // virtual screen size/origin
 static HDC hdcImg, hdcDim, hdcBack;  // screenshot, darkened screenshot, back buffer
 static DWORD *img, *dim;
 static int daemon;
-static double dim_shade;             // shade the dim buffer was computed for
+static int dim_brightness = -1;     // integer multiplier used for the cached pixels
 static double scale = 1;             // zoom
 static double vx, vy;                // image point shown at window (0,0)
 static int mx, my;                   // cursor in client coords
 static int dragging, flashlight, closing; // closing = animating back to 1:1 before hiding
+static int drawing;                 // gesture mode selected on button-down
+static int repaint_pending;         // coalesce input updates until the next display frame
 static double shade;                 // flashlight darkness, animated 0..1 towards `flashlight`
 static double radius = 200;
 
@@ -47,7 +50,7 @@ static void drop_dev(int i) {
 static int get_device(IDXGIAdapter1 *a, ID3D11Device **dev, ID3D11DeviceContext **ctx) {
     DXGI_ADAPTER_DESC1 ad;
     int i;
-    IDXGIAdapter1_GetDesc1(a, &ad);
+    if (FAILED(IDXGIAdapter1_GetDesc1(a, &ad))) return 0;
     for (i = 0; i < ndevs; i++)
         if (!memcmp(&devs[i].luid, &ad.AdapterLuid, sizeof(LUID))) break;
     if (i < ndevs && ID3D11Device_GetDeviceRemovedReason(devs[i].dev) != S_OK) { // driver reset
@@ -97,6 +100,7 @@ static void free_bufs(void) {
     hdcImg = hdcDim = hdcBack = NULL;
     img = dim = NULL;
     sw = sh = 0;
+    repaint_pending = 0;
 }
 
 // Follow the current monitor layout: allocate buffers and size the window to it.
@@ -131,14 +135,14 @@ static void open_dups(void) {
     close_dups();
     if (FAILED(CreateDXGIFactory1(&IID_IDXGIFactory1, (void **)&f))) return;
     for (int i = 0; i < ndevs; i++) devs[i].used = 0;
-    for (UINT i = 0; IDXGIFactory1_EnumAdapters1(f, i, &a) != DXGI_ERROR_NOT_FOUND; i++) {
+    for (UINT i = 0; SUCCEEDED(IDXGIFactory1_EnumAdapters1(f, i, &a)); i++) {
         ID3D11Device *dev = NULL;
         ID3D11DeviceContext *ctx;
         IDXGIOutput *o;
-        for (UINT j = 0; ndups < 16 && IDXGIAdapter1_EnumOutputs(a, j, &o) != DXGI_ERROR_NOT_FOUND; j++) {
+        for (UINT j = 0; ndups < 16 && SUCCEEDED(IDXGIAdapter1_EnumOutputs(a, j, &o)); j++) {
             DXGI_OUTPUT_DESC od;
             IDXGIOutput1 *o1;
-            IDXGIOutput_GetDesc(o, &od);
+            if (FAILED(IDXGIOutput_GetDesc(o, &od))) { IDXGIOutput_Release(o); continue; }
             // shortcut: rotated monitors are left to the GDI capture; rotate the frame if anyone needs it.
             // Device only for GPUs with a monitor: one on a laptop's idle dGPU would keep it powered.
             if (od.AttachedToDesktop && od.Rotation <= DXGI_MODE_ROTATION_IDENTITY &&
@@ -202,7 +206,8 @@ static int copy_frame(Dup *d, ID3D11Texture2D *tex) {
 }
 
 // Share a 250 ms frame-wait budget across all outputs, keeping GDI on timeout.
-static void grab(ULONGLONG deadline) {
+static int grab(ULONGLONG deadline) {
+    int captured = 0;
     for (int i = 0; i < ndups; i++) {
         Dup *d = &dups[i];
         DXGI_OUTDUPL_FRAME_INFO fi;
@@ -219,12 +224,13 @@ static void grab(ULONGLONG deadline) {
         if (fi.LastPresentTime.QuadPart &&
             SUCCEEDED(IDXGIResource_QueryInterface(res, &IID_ID3D11Texture2D, (void **)&tex))) {
             GdiFlush();
-            if (copy_frame(d, tex)) d->fresh = 0;
+            if (copy_frame(d, tex)) { d->fresh = 0; captured = 1; }
             ID3D11Texture2D_Release(tex);
         }
         IDXGIResource_Release(res);
         IDXGIOutputDuplication_ReleaseFrame(d->dup);
     }
+    return captured;
 }
 
 static int waiting(void) {
@@ -235,9 +241,11 @@ static int waiting(void) {
 
 // Map the visible part of the image to integer source/dest rects so pixels stay crisp.
 static int view_rect(int imgw, int winw, double v, double s, int *src0, int *srcw, int *dst0, int *dstw) {
-    int a = (int)floor(v), b = (int)ceil(v + winw / s);
-    if (a < 0) a = 0;
-    if (b > imgw) b = imgw;
+    // Clip in floating point first: prolonged panning can put v outside int range.
+    if (!isfinite(v) || !isfinite(s) || s <= 0 || imgw <= 0 || winw <= 0) return 0;
+    double left = max(floor(v), 0), right = min(ceil(v + winw / s), imgw);
+    if (right <= left) return 0;
+    int a = (int)left, b = (int)right;
     if (b <= a) return 0;
     *src0 = a; *srcw = b - a;
     *dst0 = (int)lround((a - v) * s);
@@ -255,36 +263,85 @@ static void blit(HDC dst, HDC src) {
 // Zoom to s keeping the image point under the cursor fixed.
 static void zoom_to(double s) {
     double ix = vx + mx / scale, iy = vy + my / scale;
-    scale = s;
+    scale = min(max(s, 0.1), 200);
     vx = ix - mx / scale;
     vy = iy - my / scale;
+}
+
+static DWORD darken(DWORD pixel, DWORD brightness) {
+    return ((pixel & 0xff00ff) * brightness >> 8 & 0xff00ff) |
+           ((pixel & 0x00ff00) * brightness >> 8 & 0x00ff00);
+}
+
+// Paint into the screenshot so marks naturally follow zoom/pan and the flashlight.
+// The pen is roughly three screen pixels wide at the zoom where it is drawn.
+static void draw_line(int x0, int y0, int x1, int y1) {
+    double ax = vx + x0 / scale, ay = vy + y0 / scale;
+    double bx = vx + x1 / scale, by = vy + y1 / scale;
+    int width = max(1, (int)lround(3 / scale));
+    if (!hdcImg || !isfinite(ax) || !isfinite(ay) || !isfinite(bx) || !isfinite(by)) return;
+    if (max(ax, bx) < -width || min(ax, bx) > sw + width ||
+        max(ay, by) < -width || min(ay, by) > sh + width) return;
+    // Leave room for the rounded endpoints and pen width before converting to GDI coordinates.
+    if (min(ax, bx) < INT_MIN / 2 || max(ax, bx) > INT_MAX / 2 ||
+        min(ay, by) < INT_MIN / 2 || max(ay, by) > INT_MAX / 2) return;
+    HPEN pen = CreatePen(PS_SOLID, width, RGB(255, 64, 64));
+    if (!pen) return;
+    HGDIOBJ old = SelectObject(hdcImg, pen);
+    if (old && old != HGDI_ERROR) {
+        int a = (int)lround(ax), b = (int)lround(ay);
+        int c = (int)lround(bx), d = (int)lround(by);
+        MoveToEx(hdcImg, a, b, NULL);
+        LineTo(hdcImg, c, d);
+        // LineTo excludes its final pixel; also make a click without movement visible.
+        SetPixelV(hdcImg, c, d, RGB(255, 64, 64));
+        SelectObject(hdcImg, old);
+        dim_brightness = -1;
+    }
+    DeleteObject(pen);
+}
+
+static HANDLE make_frame_timer(void) {
+    // High-resolution timers require Windows 10 1803; retain the standard fallback.
+    HANDLE timer = CreateWaitableTimerExW(NULL, NULL, 0x00000002, TIMER_ALL_ACCESS);
+    return timer ? timer : CreateWaitableTimerW(NULL, FALSE, NULL);
 }
 
 static void popup(HWND w) {
     HDC screen;
     POINT cursor;
     ULONGLONG deadline;
+    int captured = 0;
     if (!fit_screen(w)) {
         MessageBoxW(NULL, L"Not enough memory for the screen buffers", L"boomer", MB_ICONERROR);
         if (!daemon) DestroyWindow(w);
         return;
     }
     // GDI first as a fallback for monitors DXGI can't duplicate, then DXGI on top.
+    memset(img, 0, (size_t)sw * sh * sizeof(*img));
     screen = GetDC(NULL);
-    BitBlt(hdcImg, 0, 0, sw, sh, screen, sx, sy, SRCCOPY | CAPTUREBLT);
-    ReleaseDC(NULL, screen);
+    if (screen) {
+        captured = BitBlt(hdcImg, 0, 0, sw, sh, screen, sx, sy, SRCCOPY | CAPTUREBLT);
+        ReleaseDC(NULL, screen);
+    }
     open_dups();
     deadline = GetTickCount64() + 250;
-    do { grab(deadline); } while (waiting() && GetTickCount64() < deadline);
+    do { captured |= grab(deadline); } while (waiting() && GetTickCount64() < deadline);
     close_dups();
+    if (!captured) {
+        free_bufs();
+        MessageBoxW(NULL, L"Could not capture the desktop. Try again after unlocking the screen.", L"boomer", MB_ICONERROR);
+        if (!daemon) DestroyWindow(w);
+        return;
+    }
     flashlight = 0;
     shade = 0;
-    dim_shade = -1;
+    dim_brightness = -1;
     scale = 1;
     vx = vy = 0;
-    dragging = closing = 0;
+    dragging = drawing = closing = 0;
     if (GetCursorPos(&cursor) && ScreenToClient(w, &cursor)) { mx = cursor.x; my = cursor.y; }
-    InvalidateRect(w, NULL, FALSE);
+    repaint_pending = 1;
     ShowWindow(w, SW_SHOW);
     SetForegroundWindow(w);
 }
@@ -296,19 +353,11 @@ static void hide(HWND w) {
     free_bufs();
 }
 
-// Step the flashlight fade and close animations by the real time since the last frame, so they run
-// as smooth as the monitor refreshes and at the same speed on any refresh rate. Returns 1 while moving.
-static int animate(HWND w) {
-    static LARGE_INTEGER last;
-    LARGE_INTEGER now, f;
-    double t, k;
+// Pure time step: -1 means close, 1 means pixels changed, 0 means idle.
+static int animate(double seconds) {
+    double t = seconds / 0.0156, k;
     int moving = 0;
-    QueryPerformanceFrequency(&f);
-    QueryPerformanceCounter(&now);
-    t = (double)(now.QuadPart - last.QuadPart) / f.QuadPart / 0.0156; // in old 15.6 ms timer ticks
-    last = now;
-    if (t > 3) t = 1; // first frame after idle: one normal step, not a jump
-    if (fabs(flashlight - shade) > 1e-3) { // flashlight fade in/out
+    if (shade != flashlight) { // flashlight fade in/out
         shade += (flashlight - shade) * (1 - pow(0.75, t));
         if (fabs(flashlight - shade) <= 1e-3) shade = flashlight;
         moving = 1;
@@ -321,7 +370,7 @@ static int animate(HWND w) {
         vx *= k * scale / s;
         vy *= k * scale / s;
         scale = s;
-        if (fabs(scale - 1) < 5e-3 && fabs(vx) < 1 && fabs(vy) < 1 && shade < 0.02) { hide(w); return 0; }
+        if (fabs(scale - 1) < 5e-3 && fabs(vx) < 1 && fabs(vy) < 1 && shade < 0.02) return -1;
         return 1;
     }
     return moving;
@@ -333,7 +382,7 @@ static LRESULT CALLBACK wndproc(HWND w, UINT m, WPARAM wp, LPARAM lp) {
         if (!IsWindowVisible(w)) popup(w);
         return 0;
     case WM_MOUSEWHEEL: {
-        if (closing) return 0;
+        if (closing || drawing) return 0;
         POINT p = {(short)LOWORD(lp), (short)HIWORD(lp)};
         double f = pow(1.1, (short)HIWORD(wp) / (double)WHEEL_DELTA);
         ScreenToClient(w, &p);
@@ -343,26 +392,37 @@ static LRESULT CALLBACK wndproc(HWND w, UINT m, WPARAM wp, LPARAM lp) {
             if (radius < 10) radius = 10;
             if (radius > sw + sh) radius = sw + sh; // bigger covers the screen anyway; keeps (int)radius valid
         } else {
-            zoom_to(min(max(scale * f, 0.1), 200));
+            zoom_to(scale * f);
         }
-        InvalidateRect(w, NULL, FALSE);
+        repaint_pending = 1;
         return 0;
     }
     case WM_LBUTTONDOWN:
         if (closing) return 0;
-        dragging = 1;
+        mx = (short)LOWORD(lp); my = (short)HIWORD(lp);
+        drawing = (GetKeyState(VK_MENU) & 0x8000) != 0;
+        dragging = !drawing;
         SetCapture(w);
+        if (drawing) { draw_line(mx, my, mx, my); repaint_pending = 1; }
         return 0;
     case WM_LBUTTONUP:
-        dragging = 0;
+        if (drawing) {
+            draw_line(mx, my, (short)LOWORD(lp), (short)HIWORD(lp));
+            repaint_pending = 1;
+        }
+        dragging = drawing = 0;
         ReleaseCapture();
+        return 0;
+    case WM_CAPTURECHANGED:
+        dragging = drawing = 0;
         return 0;
     case WM_MOUSEMOVE: {
         int x = (short)LOWORD(lp), y = (short)HIWORD(lp);
-        if (!(wp & MK_LBUTTON)) dragging = 0; // button released outside (Alt+Tab mid-drag)
+        if (!(wp & MK_LBUTTON)) dragging = drawing = 0; // released outside
+        if (drawing) draw_line(mx, my, x, y);
         if (dragging) { vx -= (x - mx) / scale; vy -= (y - my) / scale; }
         mx = x; my = y;
-        if (dragging || shade > 0) InvalidateRect(w, NULL, FALSE);
+        if (dragging || drawing || shade > 0) repaint_pending = 1;
         return 0;
     }
     case WM_KEYDOWN:
@@ -370,12 +430,12 @@ static LRESULT CALLBACK wndproc(HWND w, UINT m, WPARAM wp, LPARAM lp) {
         if (wp == VK_ESCAPE || wp == 'Q') { // first press animates out, a second one skips it
             if (closing) { hide(w); return 0; }
             closing = 1;
-            flashlight = dragging = 0;
+            flashlight = dragging = drawing = 0;
             ReleaseCapture();
-            InvalidateRect(w, NULL, FALSE);
+            repaint_pending = 1;
             return 0;
         }
-        if (closing) return 0;
+        if (closing || drawing) return 0;
         if (wp == '0' || wp == VK_NUMPAD0) { scale = 1; vx = vy = 0; }
         if (wp == 'F') {
             if (!hdcDim) {
@@ -387,24 +447,25 @@ static LRESULT CALLBACK wndproc(HWND w, UINT m, WPARAM wp, LPARAM lp) {
             }
             flashlight = !flashlight;
         }
-        InvalidateRect(w, NULL, FALSE);
+        repaint_pending = 1;
         return 0;
     case WM_ERASEBKGND:
         return 1;
     case WM_PAINT: {
         PAINTSTRUCT ps;
         HDC dc = BeginPaint(w, &ps);
+        if (!hdcBack) { EndPaint(w, &ps); return 0; }
         PatBlt(hdcBack, 0, 0, sw, sh, BLACKNESS);
         if (shade == 0) blit(hdcBack, hdcImg);
         if (shade > 0) { // darkened copy everywhere, then the normal image inside the circle
             HRGN r = CreateEllipticRgn(mx - (int)radius, my - (int)radius, mx + (int)radius, my + (int)radius);
-            // The screenshot is immutable; recompute only while the shade changes.
-            if (dim_shade != shade) {
-                DWORD k = (DWORD)(256 - shade * 192); // 256 = 100%, 64 = 25% brightness
+            DWORD k = (DWORD)(256 - shade * 192); // 256 = 100%, 64 = 25% brightness
+            // Different animation values can produce the same integer pixels.
+            if (dim_brightness != (int)k) {
                 GdiFlush(); // finish GDI access before touching DIB memory
                 for (size_t i = 0; i < (size_t)sh * sw; i++)
-                    dim[i] = ((img[i] & 0xff00ff) * k >> 8 & 0xff00ff) | ((img[i] & 0x00ff00) * k >> 8 & 0x00ff00);
-                dim_shade = shade;
+                    dim[i] = darken(img[i], k);
+                dim_brightness = (int)k;
             }
             blit(hdcBack, hdcDim);
             SelectClipRgn(hdcBack, r);
@@ -414,10 +475,6 @@ static LRESULT CALLBACK wndproc(HWND w, UINT m, WPARAM wp, LPARAM lp) {
         }
         BitBlt(dc, 0, 0, sw, sh, hdcBack, 0, 0, SRCCOPY);
         EndPaint(w, &ps);
-        // Wait for the screen refresh, then step: one frame per refresh while anything moves.
-        // shortcut: if DwmFlush returns at once (rare, e.g. some remote sessions) animations spin a core until done.
-        DwmFlush();
-        if (animate(w)) InvalidateRect(w, NULL, FALSE);
         return 0;
     }
     case WM_DESTROY:
@@ -430,24 +487,134 @@ static LRESULT CALLBACK wndproc(HWND w, UINT m, WPARAM wp, LPARAM lp) {
     return DefWindowProcW(w, m, wp, lp);
 }
 
-static void self_test(void) {
+#define CHECK(condition) do { if (!(condition)) return __LINE__; } while (0)
+static int self_test(void) {
     int s, sw_, d, dw;
-    assert(view_rect(100, 100, 0, 1, &s, &sw_, &d, &dw) && s == 0 && sw_ == 100 && d == 0 && dw == 100);
-    assert(view_rect(100, 100, 10.5, 2, &s, &sw_, &d, &dw) && s == 10 && sw_ == 51 && d == -1 && dw == 102);
-    assert(view_rect(100, 100, -50, 1, &s, &sw_, &d, &dw) && s == 0 && sw_ == 50 && d == 50);
-    assert(!view_rect(100, 100, 200, 1, &s, &sw_, &d, &dw));
-    assert(clip(60, 10, 50, 50, 100, 100, &s, &d) && s == 40 && d == 50); // sticks out right
-    assert(!clip(100, 0, 50, 50, 100, 100, &s, &d));                       // fully outside
-    assert(!clip(-10, 0, 50, 50, 100, 100, &s, &d));                       // left of buffer
+    CHECK(view_rect(100, 100, 0, 1, &s, &sw_, &d, &dw) && s == 0 && sw_ == 100 && d == 0 && dw == 100);
+    CHECK(view_rect(100, 100, 10.5, 2, &s, &sw_, &d, &dw) && s == 10 && sw_ == 51 && d == -1 && dw == 102);
+    CHECK(view_rect(100, 100, -50, 1, &s, &sw_, &d, &dw) && s == 0 && sw_ == 50 && d == 50);
+    CHECK(!view_rect(100, 100, 200, 1, &s, &sw_, &d, &dw));
+    CHECK(!view_rect(100, 100, 1e30, 1, &s, &sw_, &d, &dw));
+    CHECK(!view_rect(100, 100, -1e30, 1, &s, &sw_, &d, &dw));
+    CHECK(!view_rect(100, 100, 0, 0, &s, &sw_, &d, &dw));
+    // Compare packed-channel arithmetic with independent per-channel reference values.
+    for (DWORD k = 64; k <= 256; k++) {
+        for (DWORD value = 0; value < 256; value++) {
+            DWORD r = value, g = 255 - value, b = (value * 73) & 255;
+            DWORD pixel = 0xff000000 | (r << 16) | (g << 8) | b;
+            DWORD expected = ((r * k / 256) << 16) | ((g * k / 256) << 8) | (b * k / 256);
+            CHECK(darken(pixel, k) == expected);
+        }
+    }
+    CHECK(clip(60, 10, 50, 50, 100, 100, &s, &d) && s == 40 && d == 50); // sticks out right
+    CHECK(!clip(100, 0, 50, 50, 100, 100, &s, &d));                       // fully outside
+    CHECK(!clip(-10, 0, 50, 50, 100, 100, &s, &d));                       // left of buffer
+    scale = 2; vx = 10; vy = -20; mx = 200; my = 100;
+    zoom_to(4);
+    CHECK(fabs(vx + mx / scale - 110) < 1e-9);
+    CHECK(fabs(vy + my / scale - 30) < 1e-9);
+    zoom_to(1000);
+    CHECK(scale == 200 && fabs(vx + mx / scale - 110) < 1e-9);
+    zoom_to(0.001);
+    CHECK(scale == 0.1 && fabs(vy + my / scale - 30) < 1e-9);
+    // Equal elapsed time must produce the same fade at different frame rates.
+    flashlight = 1; shade = 0; closing = 0;
+    for (int i = 0; i < 12; i++) animate(1.0 / 60);
+    double fade60 = shade;
+    shade = 0;
+    for (int i = 0; i < 48; i++) animate(1.0 / 240);
+    CHECK(fabs(shade - fade60) < 1e-9);
+    for (int rate = 30; rate <= 240; rate *= 2) {
+        for (int zoomed_out = 0; zoomed_out < 2; zoomed_out++) {
+            scale = zoomed_out ? 0.1 : 200; vx = 5000; vy = -3000;
+            shade = 1; flashlight = 0; closing = 1;
+            int result = 0;
+            for (int i = 0; i < rate * 3 && result != -1; i++) result = animate(1.0 / rate);
+            CHECK(result == -1 && fabs(scale - 1) < 0.005 && fabs(vx) < 1 && fabs(vy) < 1);
+        }
+    }
+    closing = 0; shade = 0; flashlight = 0;
+    CHECK(animate(1) == 0);
+    // Drawing targets image coordinates, invalidates the dim cache, and clips safely.
+    sw = sh = 32;
+    hdcImg = make_dib(sw, sh, &img);
+    CHECK(hdcImg && img);
+    memset(img, 0, (size_t)sw * sh * sizeof(*img));
+    scale = 2; vx = 4; vy = 6; dim_brightness = 64;
+    draw_line(4, 4, 20, 4); // image (6,8) through (14,8)
+    GdiFlush();
+    CHECK((img[8 * sw + 6] & 0xffffff) == 0xff4040);
+    CHECK((img[8 * sw + 10] & 0xffffff) == 0xff4040);
+    CHECK((img[8 * sw + 14] & 0xffffff) == 0xff4040);
+    CHECK(img[0] == 0 && dim_brightness == -1);
+    draw_line(8, 12, 8, 12); // click without movement: image (8,12)
+    GdiFlush();
+    CHECK((img[12 * sw + 8] & 0xffffff) == 0xff4040);
+    vx = vy = -1e30; dim_brightness = 64;
+    draw_line(0, 0, 100, 100);
+    CHECK(dim_brightness == 64); // off-image strokes do not touch buffers
+    free_bufs();
+    // Exercise both lazy allocation paths and repeated/partial cleanup.
+    DWORD before = GetGuiResources(GetCurrentProcess(), GR_GDIOBJECTS);
+    for (int pass = 0; pass < 100; pass++) {
+        DWORD *back;
+        sw = sh = 16;
+        hdcImg = make_dib(sw, sh, &img);
+        hdcBack = make_dib(sw, sh, &back);
+        CHECK(hdcImg && hdcBack && !hdcDim && !dim);
+        if (pass % 2) {
+            hdcDim = make_dib(sw, sh, &dim);
+            CHECK(hdcDim && dim);
+        }
+        free_bufs();
+        free_bufs();
+        CHECK(!hdcImg && !hdcDim && !hdcBack && !img && !dim);
+    }
+    hdcDim = make_dib(16, 16, &dim);
+    CHECK(hdcDim);
+    free_bufs();
+    CHECK(GetGuiResources(GetCurrentProcess(), GR_GDIOBJECTS) == before);
+    HANDLE timer = make_frame_timer();
+    LARGE_INTEGER due;
+    CHECK(timer);
+    due.QuadPart = -100000; // 10 ms, one shot
+    CHECK(SetWaitableTimer(timer, &due, 0, NULL, NULL, FALSE));
+    CHECK(WaitForSingleObject(timer, 2000) == WAIT_OBJECT_0);
+    CHECK(WaitForSingleObject(timer, 0) == WAIT_TIMEOUT); // automatically reset, not periodic
+    due.QuadPart = -10000000; // enough time to cancel deterministically
+    CHECK(SetWaitableTimer(timer, &due, 0, NULL, NULL, FALSE));
+    CHECK(CancelWaitableTimer(timer));
+    CHECK(WaitForSingleObject(timer, 30) == WAIT_TIMEOUT);
+    CloseHandle(timer);
+    return 0;
 }
 
-int WINAPI WinMain(HINSTANCE inst, HINSTANCE prevInst, LPSTR cmd, int show) {
+int WINAPI WinMain(_In_ HINSTANCE inst, _In_opt_ HINSTANCE prevInst, _In_ LPSTR cmd, _In_ int show) {
     MSG msg;
     WNDCLASSW wc = {0};
     HWND w;
+    HANDLE frame_timer;
+    LARGE_INTEGER frequency, last;
+    int armed = 0, animation_active = 0;
+    double frame_seconds = 1.0 / 60;
 
-    self_test();
-    daemon = strstr(cmd, "--daemon") != NULL;
+    int argc, test = 0;
+    LPWSTR *argv = CommandLineToArgvW(GetCommandLineW(), &argc);
+    if (!argv) return 1;
+    for (int i = 1; i < argc; i++) {
+        if (!wcscmp(argv[i], L"--daemon")) daemon = 1;
+        else if (!wcscmp(argv[i], L"--self-test")) test = 1;
+        else {
+            LocalFree(argv);
+            MessageBoxW(NULL, L"Usage: boomer.exe [--daemon] [--self-test]", L"boomer", MB_ICONERROR);
+            return 1;
+        }
+    }
+    LocalFree(argv);
+    if (test) return self_test();
+    frame_timer = make_frame_timer();
+    if (!frame_timer) return 1;
+    QueryPerformanceFrequency(&frequency);
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2); // capture real pixels, not scaled
 
     wc.lpfnWndProc = wndproc;
@@ -457,10 +624,12 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prevInst, LPSTR cmd, int show) {
     RegisterClassW(&wc);
     w = CreateWindowExW(WS_EX_TOPMOST | WS_EX_TOOLWINDOW, L"boomer", L"boomer", WS_POPUP,
                         0, 0, 1, 1, NULL, NULL, inst, NULL);
-    if (!w) return 1;
+    if (!w) { CloseHandle(frame_timer); return 1; }
     if (daemon) {
         if (!RegisterHotKey(w, 1, MOD_WIN | MOD_SHIFT | MOD_NOREPEAT, 'Z')) {
             MessageBoxW(NULL, L"Win+Shift+Z is taken (boomer already running?)", L"boomer", MB_ICONERROR);
+            DestroyWindow(w);
+            CloseHandle(frame_timer);
             return 1;
         }
         open_dups(); // warm up the GPU devices so the first popup is instant
@@ -468,9 +637,56 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prevInst, LPSTR cmd, int show) {
     } else {
         popup(w);
     }
-    while (GetMessageW(&msg, NULL, 0, 0) > 0) {
-        TranslateMessage(&msg);
-        DispatchMessageW(&msg);
+    for (;;) {
+        // Bound each batch so sustained mouse input cannot starve animation ticks.
+        for (int count = 0; count < 64 && PeekMessageW(&msg, NULL, 0, 0, PM_REMOVE); count++) {
+            if (msg.message == WM_QUIT) { CloseHandle(frame_timer); return (int)msg.wParam; }
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+        int moving = hdcBack && IsWindowVisible(w) && (repaint_pending || closing || shade != flashlight);
+        if (!moving && armed) { CancelWaitableTimer(frame_timer); armed = 0; }
+        if (!moving) animation_active = 0;
+        if (moving && !armed) {
+            if (!animation_active) {
+                DWM_TIMING_INFO timing = {sizeof(timing)};
+                if (SUCCEEDED(DwmGetCompositionTimingInfo(NULL, &timing)) && timing.qpcRefreshPeriod)
+                    frame_seconds = (double)timing.qpcRefreshPeriod / frequency.QuadPart;
+                frame_seconds = min(max(frame_seconds, 1.0 / 360), 1.0 / 30);
+                QueryPerformanceCounter(&last);
+                animation_active = 1;
+            }
+            LARGE_INTEGER due, now;
+            QueryPerformanceCounter(&now);
+            // Include painting time in the frame interval; never busy-loop when behind.
+            double remaining = frame_seconds - (double)(now.QuadPart - last.QuadPart) / frequency.QuadPart;
+            due.QuadPart = -(LONGLONG)(max(remaining, 0.001) * 10000000);
+            if (!SetWaitableTimer(frame_timer, &due, 0, NULL, NULL, FALSE)) {
+                MessageBoxW(w, L"Could not schedule animation frames", L"boomer", MB_ICONERROR);
+                DestroyWindow(w);
+                CloseHandle(frame_timer);
+                return 1;
+            }
+            armed = 1;
+        }
+        DWORD result = MsgWaitForMultipleObjectsEx(armed ? 1 : 0, &frame_timer, INFINITE,
+                                                   QS_ALLINPUT, MWMO_INPUTAVAILABLE);
+        if (armed && result == WAIT_OBJECT_0) {
+            LARGE_INTEGER now;
+            QueryPerformanceCounter(&now);
+            int changed = animate((double)(now.QuadPart - last.QuadPart) / frequency.QuadPart);
+            last = now;
+            armed = 0;
+            if (changed < 0) hide(w);
+            else if (changed || repaint_pending) {
+                repaint_pending = 0;
+                InvalidateRect(w, NULL, FALSE);
+                UpdateWindow(w); // render once per tick, after coalescing input updates
+            }
+        } else if (result == WAIT_FAILED) {
+            DestroyWindow(w);
+            CloseHandle(frame_timer);
+            return 1;
+        }
     }
-    return 0;
 }
