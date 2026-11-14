@@ -2,7 +2,6 @@
 // Drag = pan, wheel = zoom, F = flashlight, Ctrl+wheel = flashlight size,
 // 0 = reset, Q/Esc = quit.
 // `boomer --daemon` stays in the background and pops up instantly on Win+Shift+Z.
-// `--live` keeps the image updating, but hides boomer from screen sharing.
 #define WIN32_LEAN_AND_MEAN
 #define COBJMACROS
 #include <windows.h>
@@ -16,8 +15,7 @@
 static int sw, sh, sx, sy;           // virtual screen size/origin
 static HDC hdcImg, hdcDim, hdcBack;  // screenshot, darkened screenshot, back buffer
 static DWORD *img, *dim;
-static int daemon, live;
-static int dirty0, dirty1;            // rows of img changed since dim was last updated
+static int daemon;
 static double dim_shade;             // shade the dim buffer was computed for
 static double scale = 1;             // zoom
 static double vx, vy;                // image point shown at window (0,0)
@@ -35,7 +33,7 @@ typedef struct {
     int x, y, fresh;
 } Dup;
 static Dup dups[16];
-static int ndups, dup_lost, retry;
+static int ndups;
 // D3D device per GPU, kept across popups: creating one takes ~170ms, the rest ~10ms.
 static struct { LUID luid; ID3D11Device *dev; ID3D11DeviceContext *ctx; int used; } devs[8];
 static int ndevs;
@@ -72,20 +70,32 @@ static int get_device(IDXGIAdapter1 *a, ID3D11Device **dev, ID3D11DeviceContext 
 static HDC make_dib(int w, int h, DWORD **bits) {
     BITMAPINFO bi = {{sizeof(BITMAPINFOHEADER), w, -h, 1, 32, BI_RGB}};
     HDC dc = CreateCompatibleDC(NULL);
+    HBITMAP bitmap;
+    HGDIOBJ old;
     *bits = NULL;
-    SelectObject(dc, CreateDIBSection(dc, &bi, DIB_RGB_COLORS, (void **)bits, NULL, 0));
+    if (!dc) return NULL;
+    bitmap = CreateDIBSection(dc, &bi, DIB_RGB_COLORS, (void **)bits, NULL, 0);
+    old = bitmap ? SelectObject(dc, bitmap) : NULL;
+    if (!old || old == HGDI_ERROR) {
+        if (bitmap) DeleteObject(bitmap);
+        DeleteDC(dc);
+        *bits = NULL;
+        return NULL;
+    }
     return dc;
 }
 
 static void free_dib(HDC dc) {
+    if (!dc) return;
     HGDIOBJ b = GetCurrentObject(dc, OBJ_BITMAP);
     DeleteDC(dc);
     DeleteObject(b);
 }
 
 static void free_bufs(void) {
-    if (hdcImg) { free_dib(hdcImg); free_dib(hdcDim); free_dib(hdcBack); }
-    hdcImg = NULL;
+    free_dib(hdcImg); free_dib(hdcDim); free_dib(hdcBack);
+    hdcImg = hdcDim = hdcBack = NULL;
+    img = dim = NULL;
     sw = sh = 0;
 }
 
@@ -96,9 +106,8 @@ static int fit_screen(HWND w) {
     sw = GetSystemMetrics(SM_CXVIRTUALSCREEN);
     sh = GetSystemMetrics(SM_CYVIRTUALSCREEN);
     hdcImg = make_dib(sw, sh, &img);
-    hdcDim = make_dib(sw, sh, &dim);
     hdcBack = make_dib(sw, sh, &back);
-    if (!img || !dim || !back) { free_bufs(); return 0; }
+    if (!hdcImg || !hdcBack) { free_bufs(); return 0; }
     SetStretchBltMode(hdcBack, COLORONCOLOR); // nearest neighbour = pixelated
     sx = GetSystemMetrics(SM_XVIRTUALSCREEN);
     sy = GetSystemMetrics(SM_YVIRTUALSCREEN);
@@ -120,7 +129,6 @@ static void open_dups(void) {
     IDXGIFactory1 *f;
     IDXGIAdapter1 *a;
     close_dups();
-    dup_lost = 0;
     if (FAILED(CreateDXGIFactory1(&IID_IDXGIFactory1, (void **)&f))) return;
     for (int i = 0; i < ndevs; i++) devs[i].used = 0;
     for (UINT i = 0; IDXGIFactory1_EnumAdapters1(f, i, &a) != DXGI_ERROR_NOT_FOUND; i++) {
@@ -138,7 +146,6 @@ static void open_dups(void) {
                 SUCCEEDED(IDXGIOutput_QueryInterface(o, &IID_IDXGIOutput1, (void **)&o1))) {
                 Dup *d = &dups[ndups];
                 HRESULT hr = IDXGIOutput1_DuplicateOutput(o1, (IUnknown *)dev, &d->dup);
-                if (hr == E_ACCESSDENIED) dup_lost = 1; // secure desktop (lock screen, UAC): retry later
                 if (SUCCEEDED(hr)) {
                     d->dev = dev; ID3D11Device_AddRef(dev);
                     d->ctx = ctx; ID3D11DeviceContext_AddRef(ctx);
@@ -169,9 +176,8 @@ static int clip(int x0, int y0, int tw, int th, int bw, int bh, int *w, int *h) 
     return x0 >= 0 && y0 >= 0 && *w > 0 && *h > 0;
 }
 
-// Returns 1 if any pixel changed: our own repaints also produce frames, so skip identical ones.
+// Copy one screenshot per output; returns 1 on success.
 static int copy_frame(Dup *d, ID3D11Texture2D *tex) {
-    int changed = 0;
     D3D11_TEXTURE2D_DESC td;
     D3D11_MAPPED_SUBRESOURCE map;
     int x0 = d->x - sx, y0 = d->y - sy, w, h;
@@ -189,42 +195,36 @@ static int copy_frame(Dup *d, ID3D11Texture2D *tex) {
     for (int y = 0; y < h; y++) {
         DWORD *dst = img + (size_t)(y0 + y) * sw + x0;
         BYTE *src = (BYTE *)map.pData + (size_t)y * map.RowPitch;
-        if (memcmp(dst, src, (size_t)w * 4)) {
-            memcpy(dst, src, (size_t)w * 4);
-            changed = 1;
-            dirty0 = min(dirty0, y0 + y);
-            dirty1 = max(dirty1, y0 + y + 1);
-        }
+        memcpy(dst, src, (size_t)w * 4);
     }
     ID3D11DeviceContext_Unmap(d->ctx, (ID3D11Resource *)d->stage, 0);
-    return changed;
+    return 1;
 }
 
-// Pull new frames into img; returns 1 if the picture changed.
-static int grab(UINT timeout) {
-    int changed = 0;
+// Share a 250 ms frame-wait budget across all outputs, keeping GDI on timeout.
+static void grab(ULONGLONG deadline) {
     for (int i = 0; i < ndups; i++) {
         Dup *d = &dups[i];
         DXGI_OUTDUPL_FRAME_INFO fi;
         IDXGIResource *res;
         ID3D11Texture2D *tex;
         HRESULT hr;
-        if (timeout && !d->fresh) continue; // popup wait: this monitor is already captured
+        ULONGLONG now = GetTickCount64();
+        UINT timeout = now < deadline ? (UINT)min(deadline - now, 25) : 0;
+        if (!d->fresh) continue;
         hr = IDXGIOutputDuplication_AcquireNextFrame(d->dup, timeout, &fi, &res);
         if (hr == DXGI_ERROR_WAIT_TIMEOUT) continue;
-        if (FAILED(hr)) { dup_lost = 1; continue; } // mode switch, UAC, lock screen...
+        if (FAILED(hr)) { d->fresh = 0; continue; } // retain the GDI fallback
         // 0 = no new image (cursor-only update, or the black first frame of a new duplication)
         if (fi.LastPresentTime.QuadPart &&
             SUCCEEDED(IDXGIResource_QueryInterface(res, &IID_ID3D11Texture2D, (void **)&tex))) {
             GdiFlush();
-            changed |= copy_frame(d, tex);
+            if (copy_frame(d, tex)) d->fresh = 0;
             ID3D11Texture2D_Release(tex);
-            d->fresh = 0;
         }
         IDXGIResource_Release(res);
         IDXGIOutputDuplication_ReleaseFrame(d->dup);
     }
-    return changed;
 }
 
 static int waiting(void) {
@@ -262,6 +262,8 @@ static void zoom_to(double s) {
 
 static void popup(HWND w) {
     HDC screen;
+    POINT cursor;
+    ULONGLONG deadline;
     if (!fit_screen(w)) {
         MessageBoxW(NULL, L"Not enough memory for the screen buffers", L"boomer", MB_ICONERROR);
         if (!daemon) DestroyWindow(w);
@@ -272,27 +274,25 @@ static void popup(HWND w) {
     BitBlt(hdcImg, 0, 0, sw, sh, screen, sx, sy, SRCCOPY | CAPTUREBLT);
     ReleaseDC(NULL, screen);
     open_dups();
-    for (int t = 0; t < 10 && waiting(); t++) grab(25); // first real frame from every monitor
-    if (!live) close_dups();
+    deadline = GetTickCount64() + 250;
+    do { grab(deadline); } while (waiting() && GetTickCount64() < deadline);
+    close_dups();
     flashlight = 0;
     shade = 0;
-    dirty0 = 0;
-    dirty1 = sh;
+    dim_shade = -1;
     scale = 1;
     vx = vy = 0;
     dragging = closing = 0;
+    if (GetCursorPos(&cursor) && ScreenToClient(w, &cursor)) { mx = cursor.x; my = cursor.y; }
     InvalidateRect(w, NULL, FALSE);
-    if (live) SetTimer(w, 1, 15, NULL);
     ShowWindow(w, SW_SHOW);
     SetForegroundWindow(w);
 }
 
 static void hide(HWND w) {
-    close_dups();
     if (!daemon) { DestroyWindow(w); return; }
-    KillTimer(w, 1);
     ShowWindow(w, SW_HIDE);
-    // Don't hold three screen-sized buffers while idle; fit_screen reallocates on popup.
+    // Don't hold screen-sized buffers while idle; fit_screen reallocates on popup.
     free_bufs();
 }
 
@@ -368,7 +368,7 @@ static LRESULT CALLBACK wndproc(HWND w, UINT m, WPARAM wp, LPARAM lp) {
     case WM_KEYDOWN:
         if (lp & 0x40000000) return 0; // auto-repeat of a held key
         if (wp == VK_ESCAPE || wp == 'Q') { // first press animates out, a second one skips it
-            if (closing) hide(w);
+            if (closing) { hide(w); return 0; }
             closing = 1;
             flashlight = dragging = 0;
             ReleaseCapture();
@@ -377,12 +377,17 @@ static LRESULT CALLBACK wndproc(HWND w, UINT m, WPARAM wp, LPARAM lp) {
         }
         if (closing) return 0;
         if (wp == '0' || wp == VK_NUMPAD0) { scale = 1; vx = vy = 0; }
-        if (wp == 'F') flashlight = !flashlight;
+        if (wp == 'F') {
+            if (!hdcDim) {
+                hdcDim = make_dib(sw, sh, &dim);
+                if (!hdcDim) {
+                    MessageBoxW(w, L"Not enough memory for the flashlight", L"boomer", MB_ICONERROR);
+                    return 0;
+                }
+            }
+            flashlight = !flashlight;
+        }
         InvalidateRect(w, NULL, FALSE);
-        return 0;
-    case WM_TIMER: // live capture only
-        if (dup_lost && ++retry % 30 == 0) open_dups();
-        if (grab(0)) InvalidateRect(w, NULL, FALSE);
         return 0;
     case WM_ERASEBKGND:
         return 1;
@@ -393,14 +398,14 @@ static LRESULT CALLBACK wndproc(HWND w, UINT m, WPARAM wp, LPARAM lp) {
         if (shade == 0) blit(hdcBack, hdcImg);
         if (shade > 0) { // darkened copy everywhere, then the normal image inside the circle
             HRGN r = CreateEllipticRgn(mx - (int)radius, my - (int)radius, mx + (int)radius, my + (int)radius);
-            // Recompute all rows while fading, otherwise only rows the live capture changed.
-            int a = dim_shade != shade ? 0 : dirty0, b = dim_shade != shade ? sh : dirty1;
-            DWORD k = (DWORD)(256 - shade * 192); // 256 = 100%, 64 = 25% brightness
-            for (size_t i = (size_t)a * sw; i < (size_t)b * sw; i++)
-                dim[i] = ((img[i] & 0xff00ff) * k >> 8 & 0xff00ff) | ((img[i] & 0x00ff00) * k >> 8 & 0x00ff00);
-            dirty0 = sh;
-            dirty1 = 0;
-            dim_shade = shade;
+            // The screenshot is immutable; recompute only while the shade changes.
+            if (dim_shade != shade) {
+                DWORD k = (DWORD)(256 - shade * 192); // 256 = 100%, 64 = 25% brightness
+                GdiFlush(); // finish GDI access before touching DIB memory
+                for (size_t i = 0; i < (size_t)sh * sw; i++)
+                    dim[i] = ((img[i] & 0xff00ff) * k >> 8 & 0xff00ff) | ((img[i] & 0x00ff00) * k >> 8 & 0x00ff00);
+                dim_shade = shade;
+            }
             blit(hdcBack, hdcDim);
             SelectClipRgn(hdcBack, r);
             blit(hdcBack, hdcImg);
@@ -416,6 +421,9 @@ static LRESULT CALLBACK wndproc(HWND w, UINT m, WPARAM wp, LPARAM lp) {
         return 0;
     }
     case WM_DESTROY:
+        close_dups();
+        free_bufs();
+        while (ndevs) drop_dev(ndevs - 1);
         PostQuitMessage(0);
         return 0;
     }
@@ -440,7 +448,6 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prevInst, LPSTR cmd, int show) {
 
     self_test();
     daemon = strstr(cmd, "--daemon") != NULL;
-    live = strstr(cmd, "--live") != NULL;
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2); // capture real pixels, not scaled
 
     wc.lpfnWndProc = wndproc;
@@ -450,9 +457,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prevInst, LPSTR cmd, int show) {
     RegisterClassW(&wc);
     w = CreateWindowExW(WS_EX_TOPMOST | WS_EX_TOOLWINDOW, L"boomer", L"boomer", WS_POPUP,
                         0, 0, 1, 1, NULL, NULL, inst, NULL);
-    // Live capture must not see our own window; this also hides boomer from screen sharing.
-    // Before Windows 10 2004 that fails and we'd capture ourselves, so zoom a still screenshot instead.
-    if (live && !SetWindowDisplayAffinity(w, WDA_EXCLUDEFROMCAPTURE)) live = 0;
+    if (!w) return 1;
     if (daemon) {
         if (!RegisterHotKey(w, 1, MOD_WIN | MOD_SHIFT | MOD_NOREPEAT, 'Z')) {
             MessageBoxW(NULL, L"Win+Shift+Z is taken (boomer already running?)", L"boomer", MB_ICONERROR);
